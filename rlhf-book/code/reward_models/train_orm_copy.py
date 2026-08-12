@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Outcome Reward Model (ORM) Training
+
+Original implementation by @myhott163com
+Source: https://github.com/myhott163com/RLHF_ORM_PRM
+License: MIT
+
+Adapted for RLHF Book (https://rlhfbook.com) by Nathan Lambert
+
+This script trains a minimal outcome reward model by fine-tuning a base LLM
+on GSM8K-derived correct/incorrect math answers. For each question,
+we parse the gold numeric answer and synthesize wrong completions by adding
+random offsets. The model learns to classify solution correctness via per-token
+BCE loss on completion tokens.
+
+See Chapter 5 (Reward Models) of RLHF Book for theoretical background.
+
+Usage:
+    uv run python -m reward_models.train_orm --config reward_models/configs/orm.yaml
+"""
+
+import argparse
+import random
+from typing import Dict, List
+
+import torch
+import torch.nn.functional as F
+from datasets import Dataset, load_dataset
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+from reward_models.base import (
+    BaseRewardModel,
+    create_optimizer,
+    finish_wandb,
+    init_wandb,
+    load_tokenizer,
+    log_metrics,
+)
+from reward_models.config import Config, load_config
+
+
+# =============================================================================
+# Data Preparation
+# =============================================================================
+
+
+def parse_answer(text: str) -> int | None:
+    """Extract numeric answer from GSM8K solution text.
+
+    GSM8K answers are formatted as "#### <number>" at the end.
+    This function extracts that number, handling commas and edge cases.
+    """
+    if "####" in text:
+        tail = text.split("####")[-1]
+    else:
+        sentences = [seg.strip() for seg in text.strip().split("\n") if seg.strip()]
+        tail = sentences[-1] if sentences else text
+
+    tokens = tail.replace(",", "").split()
+    for token in reversed(tokens):
+        digits = "".join(ch for ch in token if ch.isdigit() or ch == "-")
+        if digits:
+            try:
+                return int(digits)
+            except ValueError:
+                continue
+    return None
+
+
+def pack_example(
+    prompt: str, completion: str, label: int, tokenizer: AutoTokenizer
+) -> Dict[str, List[int]]:
+    """Pack a (prompt, completion, label) into tokenized format.
+
+    The label is applied to all completion tokens, with prompt tokens masked (-100).
+    """
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    completion_ids = tokenizer(completion + tokenizer.eos_token, add_special_tokens=False)[
+        "input_ids"
+    ]
+    input_ids = prompt_ids + completion_ids
+    attention = [1] * len(input_ids)
+    labels = [-100] * len(prompt_ids) + [label] * len(completion_ids)
+    return {"input_ids": input_ids, "attention_mask": attention, "labels": labels}
+
+
+def build_orm_dataset(
+    tokenizer: AutoTokenizer,
+    config: Config,
+) -> Dataset:
+    """Build ORM training dataset from GSM8K.
+
+    For each question:
+    - Creates a positive example with the correct solution (label=1)
+    - Creates a negative example with a corrupted answer (label=0)
+    """
+    random.seed(config.seed)
+    raw = load_dataset(
+        config.dataset_name,
+        "main",
+        split=config.dataset_split,
+    )
+
+    samples = min(config.samples, len(raw))
+    raw = raw.shuffle(seed=config.seed).select(range(samples))
+    rows = []
+
+    for ex in raw:
+        question = ex["question"].strip()
+        prompt = f"Question: {question}\nAnswer:"
+        answer = ex["answer"].strip()
+        value = parse_answer(answer)
+
+        if value is None:
+            continue
+
+        # Correct example
+        rows.append(pack_example(prompt, answer, 1, tokenizer))
+
+        # Incorrect example (add random offset to answer)
+        wrong = value + random.randint(1, 9)
+        wrong_solution = answer + f"\nTherefore, the answer is {wrong}."
+        rows.append(pack_example(prompt, wrong_solution, 0, tokenizer))
+
+    return Dataset.from_list(rows)
+
+
+def collate_fn(batch: List[Dict], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
+    """Collate function for DataLoader - pads sequences to same length."""
+    max_len = max(len(x["input_ids"]) for x in batch)
+    inputs = torch.full((len(batch), max_len), tokenizer.pad_token_id, dtype=torch.long)
+    attn = torch.zeros_like(inputs)
+    labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
+
+    for i, item in enumerate(batch):
+        length = len(item["input_ids"])
+        inputs[i, :length] = torch.tensor(item["input_ids"], dtype=torch.long)
+        attn[i, :length] = torch.tensor(item["attention_mask"], dtype=torch.long)
+        labels[i, :length] = torch.tensor(item["labels"], dtype=torch.long)
+
+    return {"input_ids": inputs, "attention_mask": attn, "labels": labels}
+
+
+# =============================================================================
+# Model Definition
+# =============================================================================
+
+
+def last_token_values(values: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Select each sequence's final non-padding value."""
+    last_indices = attention_mask.sum(dim=1) - 1
+    return values.gather(1, last_indices.unsqueeze(1)).squeeze(1)
+
+
+class OutcomeRewardModel(BaseRewardModel):
+    """Outcome Reward Model with full fine-tuning.
+
+    Architecture:
+    - Base LLM (e.g., Qwen3) loaded in bfloat16
+    - Linear head mapping hidden states to scalar reward
+
+    The model outputs per-token logits which are trained with BCE loss
+    on completion tokens only (prompt tokens are masked).
+    """
+
+    def __init__(self, model_id: str, **kwargs):
+        super().__init__(model_id, head_dim=1, **kwargs)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Forward pass computing reward logits and optional loss.
+
+        Args:
+            input_ids: Token IDs [batch, seq_len]
+            attention_mask: Attention mask [batch, seq_len]
+            labels: Per-token labels (0/1 for completion, -100 for masked) [batch, seq_len]
+
+        Returns:
+            loss: BCE loss on completion tokens (None if labels not provided)
+            logits: Per-token reward logits [batch, seq_len]
+        """
+        hidden = self.get_hidden_states(input_ids, attention_mask)
+        logits = self.head(hidden).squeeze(-1)
+
+        loss = None
+        if labels is not None:
+            mask = labels != -100
+            if mask.any():
+                loss = F.binary_cross_entropy_with_logits(logits[mask], labels[mask].float())
+            else:
+                loss = logits.sum() * 0
+
+        return loss, logits
+
+
+# =============================================================================
+# Training
+# =============================================================================
+
+
+def train_orm(
+    config: Config,
+) -> OutcomeRewardModel:
+    """Train an Outcome Reward Model on GSM8K.
+
+    Args:
+        config: Configuration object containing training parameters.
+
+    Returns:
+        Trained OutcomeRewardModel
+    """
+    
+    random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    device = torch.device(config.get_device())
+    
+    model = OutcomeRewardModel(model_id = config.model_id, device= device)
+    data = build_orm_dataset(tokenizer = model.model.tokenizer, config=config)
+    opt = create_optimizer(model, lr = config.lr)
+    for epoch in range(config.epochs):
+        dataloader = DataLoader(
+            data,
+            batch_size=config.batch_size,
+            shuffle=True,
+            collate_fn=lambda batch: collate_fn(batch, model.model.tokenizer),
+        )
+        for step, batch in enumerate(dataloader):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss, _ = model(**batch)
+            loss.backward()
+
+            if (step + 1) % config.grad_accum_steps == 0:
+                opt.step()
+                opt.zero_grad()
+
+            if (step + 1) % config.eval_interval == 0:
+                log_metrics(model, batch, step + 1)
+        
+    return model
+
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+
+
+def score_completion(
+    model: OutcomeRewardModel,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    completion: str,
+    device: torch.device,
+) -> float:
+    """Score a single completion using the trained ORM.
+
+    Returns the final completion token's probability.
+    """
+    example = pack_example(prompt, completion, 1, tokenizer)  # Label doesn't matter for inference
+    batch = collate_fn([example], tokenizer)
+    batch = {k: v.to(device) for k, v in batch.items()}
+
+    model.eval()
+    with torch.no_grad():
+        _, logits = model(**batch)
+        score = torch.sigmoid(last_token_values(logits, batch["attention_mask"]))
+
+    return score[0].item()
+
+
+def demo_scoring(model: OutcomeRewardModel, tokenizer: AutoTokenizer, config: Config):
+    """Demo: Score an unseen GSM8K test question."""
+    device = next(model.parameters()).device
+    random.seed(config.seed)
+
+    # Get a random test example
+    test_data = load_dataset(
+        config.dataset_name,
+        "main",
+        split="test",
+    )
+    sample = random.choice(test_data)
+
+    question = sample["question"].strip()
+    answer = sample["answer"].strip()
+    value = parse_answer(answer)
+
+    if value is None:
+        print("Could not parse answer from sample")
+        return
+
+    prompt = f"Question: {question}\nAnswer:"
+
+    # Create correct and incorrect completions
+    wrong_value = value + random.randint(1, 9)
+    wrong_answer = answer + f"\nTherefore, the answer is {wrong_value}."
+
+    print("=" * 60)
+    print("Question:", question)
+    print("=" * 60)
+
+    correct_score = score_completion(model, tokenizer, prompt, answer, device)
+    print(f"\nCorrect completion (answer={value}):")
+    print(answer[:200] + "..." if len(answer) > 200 else answer)
+    print(f"Score: {correct_score:.3f}")
+
+    incorrect_score = score_completion(model, tokenizer, prompt, wrong_answer, device)
+    print(f"\nIncorrect completion (answer={wrong_value}):")
+    print(wrong_answer[:200] + "..." if len(wrong_answer) > 200 else wrong_answer)
+    print(f"Score: {incorrect_score:.3f}")
+
+    print(f"\nModel correctly prefers correct answer: {correct_score > incorrect_score}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train Outcome Reward Model on GSM8K",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    model = train_orm(config=cfg)
+
+    if not cfg.skip_demo:
+        tokenizer = load_tokenizer(cfg.model_id)
+        demo_scoring(model, tokenizer, cfg)
+
+
+if __name__ == "__main__":
+    main()

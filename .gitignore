@@ -1,0 +1,15 @@
+*
+!.gitignore
+!reinforcement_learning_from_scratch/
+!reinforcement_learning_from_scratch/**
+!rlhf-book/
+!rlhf-book/code/
+!rlhf-book/code/**
+!TranformerRL/
+!TranformerRL/**
+
+# Python generated files and local secrets
+__pycache__/
+*.py[cod]
+.env
+!.env
