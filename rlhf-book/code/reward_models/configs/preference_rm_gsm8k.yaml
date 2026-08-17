@@ -1,0 +1,25 @@
+# Bradley--Terry preference RM on the exact GSM8K subset used by orm.yaml.
+# Run: python -m reward_models.train_preference_rm_gsm8k --config reward_models/configs/preference_rm_gsm8k.yaml
+
+model_id: Qwen/Qwen3-0.6B-Base
+freeze_backbone: true
+
+dataset_name: openai/gsm8k
+dataset_split: train
+samples: 2000
+max_length: 512
+
+batch_size: 8
+grad_accum_steps: 4
+epochs: 3
+lr: 1.0e-4
+warmup_ratio: 0.1
+lr_scheduler: warmup_only
+seed: 7
+val_ratio: 0.1
+eval_interval: 25
+
+device: cpu
+device_id: 0
+use_wandb: true
+skip_demo: true
