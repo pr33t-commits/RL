@@ -7,7 +7,7 @@
 
 # Model
 model_id: Qwen/Qwen3-0.6B-Base
-freeze_backbone: true
+freeze_backbone: false
 
 # Dataset
 dataset_name: openai/gsm8k
@@ -24,7 +24,7 @@ lr_scheduler: warmup_only
 seed: 7
 
 # Hardware
-device: cpu
+device: cuda
 device_id: 0
 
 # Logging / demo
