@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import json
 import random
 from pathlib import Path
 from typing import Dict, List
@@ -93,13 +94,62 @@ def build_orm_dataset(
     tokenizer: AutoTokenizer,
     config: Config,
 ) -> Dataset:
-    """Build ORM training dataset from GSM8K.
+    """Build ORM examples from the configured rollout dataset.
 
-    For each question:
-    - Creates a positive example with the correct solution (label=1)
-    - Creates a negative example with a corrupted answer (label=0)
+    For the local JSONL rollout format, every row is already labeled with
+    ``label`` (1 for correct, 0 for incorrect).  We retain every rollout so
+    this ORM sees exactly the same questions and solutions as the preference
+    reward model.  The older GSM8K download/synthetic-negative path remains
+    available when ``dataset_name`` is a Hugging Face dataset ID.
     """
     random.seed(config.seed)
+
+    dataset_path = Path(config.dataset_name)
+    if not dataset_path.is_absolute() and not dataset_path.exists():
+        # Config paths are normally resolved from the code repository root;
+        # also support callers whose working directory is elsewhere.
+        dataset_path = Path(__file__).resolve().parent.parent / dataset_path
+    if dataset_path.exists() and dataset_path.suffix.lower() in {".jsonl", ".json"}:
+        records = []
+        with dataset_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSON on line {line_number} of {dataset_path}") from exc
+                if not isinstance(record, dict):
+                    continue
+                records.append(record)
+
+        grouped: Dict[str, List[Dict]] = {}
+        for record in records:
+            problem_id = str(record.get("problem_index", record.get("question", "")))
+            if not problem_id or not record.get("question") or not record.get("solution"):
+                continue
+            grouped.setdefault(problem_id, []).append(record)
+
+        problem_ids = list(grouped)
+        random.Random(config.seed).shuffle(problem_ids)
+        selected_ids = set(problem_ids[: min(config.samples, len(problem_ids))])
+        rows = []
+        for problem_id in problem_ids:
+            if problem_id not in selected_ids:
+                continue
+            for record in grouped[problem_id]:
+                label = int(bool(record.get("label", record.get("judge_correct", False))))
+                prompt = f"Question: {str(record['question']).strip()}\nAnswer:"
+                rows.append(pack_example(prompt, str(record["solution"]).strip(), label, tokenizer))
+
+        if not rows:
+            raise ValueError(f"No valid labeled rollouts found in {dataset_path}")
+        print(
+            f"Loaded {len(rows)} rollouts from {len(selected_ids)} problem IDs in {dataset_path}"
+        )
+        return Dataset.from_list(rows)
+
     raw = load_dataset(
         config.dataset_name,
         "main",
@@ -213,6 +263,7 @@ def evaluate_orm(
     loader: DataLoader,
     device: torch.device,
     autocast_enabled: bool,
+    autocast_device_type: str,
 ) -> dict[str, float]:
     """Evaluate ORM loss and sequence-level accuracy on a validation split."""
     model.eval()
@@ -224,7 +275,9 @@ def evaluate_orm(
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        with torch.amp.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        with torch.amp.autocast(
+            autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
             loss, logits = model(**batch)
 
         sequence_logits = last_token_values(logits, batch["attention_mask"])
@@ -364,7 +417,8 @@ def train_orm(
         )
 
     # Mixed precision
-    autocast_enabled = torch.cuda.is_available()
+    autocast_enabled = device.type == "cuda" and torch.cuda.is_available()
+    autocast_device_type = "cuda" if autocast_enabled else "cpu"
 
     # Training loop
     global_step = 0
@@ -391,7 +445,9 @@ def train_orm(
         for step, batch in tqdm(enumerate(loader)):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+            with torch.amp.autocast(
+                autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+            ):
                 loss, logits = model(**batch)
             print(f"Step {step} | Forward pass done")
             (loss / grad_accum_steps).backward()
@@ -429,7 +485,9 @@ def train_orm(
                 log_metrics({"loss": avg_loss, "accuracy": acc}, step=global_step)
 
                 if val_loader is not None and eval_interval > 0 and global_step % eval_interval == 0:
-                    val_metrics = evaluate_orm(model, val_loader, device, autocast_enabled)
+                    val_metrics = evaluate_orm(
+                        model, val_loader, device, autocast_enabled, autocast_device_type
+                    )
                     print(
                         f"Eval step {global_step} | "
                         f"Val Loss: {val_metrics['val/loss']:.4f} | "
@@ -455,7 +513,9 @@ def train_orm(
             eval_interval <= 0 or global_step % eval_interval != 0
         )
         if should_run_epoch_eval:
-            val_metrics = evaluate_orm(model, val_loader, device, autocast_enabled)
+            val_metrics = evaluate_orm(
+                model, val_loader, device, autocast_enabled, autocast_device_type
+            )
             print(
                 f"Epoch {epoch} | Val Loss: {val_metrics['val/loss']:.4f} | "
                 f"Val Accuracy: {val_metrics['val/accuracy']:.3f}"
@@ -469,7 +529,7 @@ def train_orm(
         model,
         tokenizer,
         config,
-        run_name="orm_gsm8k",
+        run_name="orm_gsm8k_full" if not config.freeze_backbone else "orm_gsm8k_head_only",
         train_loss_steps=train_loss_steps,
         train_loss_values=train_loss_values,
         val_loss_steps=val_loss_steps,
@@ -490,6 +550,7 @@ def save_model_artifacts(
     val_loss_values: List[float],
 ) -> Path:
     """Persist the trained reward model, tokenizer, and training metadata."""
+    
     output_dir = Path(__file__).resolve().parent / "trained_models" / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -564,27 +625,38 @@ def demo_scoring(model: OutcomeRewardModel, tokenizer: AutoTokenizer, config: Co
     device = next(model.parameters()).device
     random.seed(config.seed)
 
-    # Get a random test example
-    test_data = load_dataset(
-        config.dataset_name,
-        "main",
-        split="test",
-    )
-    sample = random.choice(test_data)
-
-    question = sample["question"].strip()
-    answer = sample["answer"].strip()
-    value = parse_answer(answer)
-
-    if value is None:
-        print("Could not parse answer from sample")
-        return
+    dataset_path = Path(config.dataset_name)
+    if not dataset_path.is_absolute() and not dataset_path.exists():
+        dataset_path = Path(__file__).resolve().parent.parent / dataset_path
+    if dataset_path.is_file():
+        with dataset_path.open(encoding="utf-8") as handle:
+            rollout_data = [json.loads(line) for line in handle if line.strip()]
+        sample = random.choice(rollout_data)
+        question = str(sample["question"]).strip()
+        answer = str(sample["solution"]).strip()
+        value = sample.get("candidate_answer", parse_answer(answer))
+        opposite = next(
+            (row for row in rollout_data
+             if row.get("problem_index") == sample.get("problem_index")
+             and int(row.get("label", 0)) != int(sample.get("label", 0))),
+            None,
+        )
+        wrong_answer = str(opposite["solution"]).strip() if opposite else answer
+        wrong_value = opposite.get("candidate_answer", "incorrect") if opposite else "incorrect"
+    else:
+        # Get a random test example from the original GSM8K dataset.
+        test_data = load_dataset(config.dataset_name, "main", split="test")
+        sample = random.choice(test_data)
+        question = sample["question"].strip()
+        answer = sample["answer"].strip()
+        value = parse_answer(answer)
+        if value is None:
+            print("Could not parse answer from sample")
+            return
+        wrong_value = value + random.randint(1, 9)
+        wrong_answer = answer + f"\nTherefore, the answer is {wrong_value}."
 
     prompt = f"Question: {question}\nAnswer:"
-
-    # Create correct and incorrect completions
-    wrong_value = value + random.randint(1, 9)
-    wrong_answer = answer + f"\nTherefore, the answer is {wrong_value}."
 
     print("=" * 60)
     print("Question:", question)

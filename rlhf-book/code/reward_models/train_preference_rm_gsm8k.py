@@ -19,6 +19,7 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
+from dotenv import find_dotenv, load_dotenv
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
@@ -34,11 +35,15 @@ from reward_models.base import (
 )
 from reward_models.config import Config, load_config
 
+dotenv_path = find_dotenv(usecwd=True)
+if dotenv_path:
+    load_dotenv(dotenv_path, override=True)
+else:
+    load_dotenv(override=True)
 
 # =============================================================================
 # Data preparation
 # =============================================================================
-
 
 def tokenize_math_completion(
     tokenizer: AutoTokenizer, prompt: str, completion: str, max_length: int
@@ -225,7 +230,8 @@ def save_model_artifacts(
     history: dict[str, list],
 ) -> Path:
     """Save checkpoint, tokenizer, configuration, and tracked training loss."""
-    output_dir = Path(__file__).resolve().parent / "trained_models" / "preference_rm_gsm8k"
+    training_extent = "full" if not config.freeze_backbone else "head_only"
+    output_dir = Path(__file__).resolve().parent / "trained_models" / f"preference_rm_gsm8k_{training_extent}"
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), output_dir / "model_state.pt")
     torch.save(model.head.state_dict(), output_dir / "reward_head.pt")
