@@ -1,12 +1,14 @@
-# Bradley--Terry preference RM on the exact GSM8K subset used by orm.yaml.
+# Bradley--Terry preference RM on local GSM8K solution rollouts.
 # Run: python -m reward_models.train_preference_rm_gsm8k --config reward_models/configs/preference_rm_gsm8k.yaml
 
 model_id: Qwen/Qwen3-0.6B-Base
 freeze_backbone: true
 
-dataset_name: openai/gsm8k
+# Local rollout JSONL. Pairs are all correct x incorrect solutions per problem.
+dataset_name: reward_models/data/gsm8k_gpt4.jsonl
 dataset_split: train
-samples: 2000
+# Maximum number of problem IDs to use (there are 100 in the current file).
+samples: 100
 max_length: 512
 
 batch_size: 8
