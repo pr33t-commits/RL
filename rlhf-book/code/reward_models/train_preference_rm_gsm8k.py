@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Preference Reward Model training on the same GSM8K data as ``train_orm.py``.
+"""Preference Reward Model training on local GSM8K solution rollouts.
 
-For every sampled GSM8K question, the original worked solution is the chosen
-completion and the ORM's corrupted-final-answer variant is rejected. The model
-is trained with Bradley--Terry loss: ``-log(sigmoid(r_chosen - r_rejected))``.
+For each problem in the JSONL file, every correct rollout is paired with every
+incorrect rollout. The model is trained with Bradley--Terry loss:
+``-log(sigmoid(r_chosen - r_rejected))``.
 
 Usage:
     python -m reward_models.train_preference_rm_gsm8k \
@@ -18,7 +18,7 @@ from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
@@ -33,7 +33,6 @@ from reward_models.base import (
     pad_sequences,
 )
 from reward_models.config import Config, load_config
-from reward_models.train_orm import parse_answer
 
 
 # =============================================================================
@@ -44,58 +43,106 @@ from reward_models.train_orm import parse_answer
 def tokenize_math_completion(
     tokenizer: AutoTokenizer, prompt: str, completion: str, max_length: int
 ) -> Dict[str, List[int]]:
-    """Tokenize the ORM's ``Question: ... Answer:`` prompt and completion."""
-    tokens = tokenizer(
-        prompt + completion + tokenizer.eos_token,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_length,
-    )
-    return {"input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]}
+    """Tokenize prompt and rollout, retaining the rollout's final answer.
 
+    Correctness in GSM8K is expressed at the end of a rollout. When a sequence
+    exceeds ``max_length``, retain all of the prompt when possible and truncate
+    the *start* of the completion, rather than accidentally removing its final
+    answer as ordinary right truncation would.
+    """
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    completion_ids = tokenizer(
+        completion + tokenizer.eos_token, add_special_tokens=False
+    )["input_ids"]
+    if len(prompt_ids) + len(completion_ids) > max_length:
+        if len(prompt_ids) >= max_length:
+            prompt_ids = prompt_ids[: max_length // 2]
+        completion_budget = max_length - len(prompt_ids)
+        completion_ids = completion_ids[-completion_budget:]
+    input_ids = prompt_ids + completion_ids
+    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids)}
 
 def build_preference_dataset(tokenizer: AutoTokenizer, config: Config) -> Dataset:
-    """Build chosen/rejected pairs from the same seeded GSM8K subset as ORM."""
-    if config.dataset_name != "openai/gsm8k":
-        raise ValueError(
-            "This trainer requires dataset_name: openai/gsm8k. Use "
-            "preference_rm_gsm8k.yaml or orm.yaml, not preference_rm.yaml."
-        )
+    """Create all correct-vs-incorrect rollout pairs within every problem.
 
-    random.seed(config.seed)
-    raw = load_dataset(config.dataset_name, "main", split=config.dataset_split)
-    raw = raw.shuffle(seed=config.seed).select(range(min(config.samples, len(raw))))
+    ``dataset_name`` is a path to a JSONL rollout file. Expected fields are
+    ``problem_index`` (problem ID), ``question``, ``solution``, and ``label``;
+    a label of 1 is correct and 0 is incorrect. For a problem with C correct
+    and I incorrect rollouts, this produces C * I preference pairs.
+    """
+    rollout_path = Path(config.dataset_name)
+    if not rollout_path.is_file():
+        raise FileNotFoundError(f"Rollout JSONL file not found: {rollout_path}")
 
+    grouped: dict[str, dict[str, object]] = {}
+    with rollout_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            required = {"problem_index", "question", "solution", "label"}
+            missing = required.difference(row)
+            if missing:
+                raise ValueError(f"Line {line_number} is missing required fields: {sorted(missing)}")
+            problem_id = str(row["problem_index"])
+            group = grouped.setdefault(
+                problem_id, {"question": row["question"].strip(), "correct": [], "incorrect": []}
+            )
+            if group["question"] != row["question"].strip():
+                raise ValueError(f"Problem {problem_id} has inconsistent question text.")
+            bucket = "correct" if int(row["label"]) == 1 else "incorrect"
+            group[bucket].append(row["solution"].strip())
+
+    problem_ids = list(grouped)
+    random.Random(config.seed).shuffle(problem_ids)
+    problem_ids = problem_ids[: min(config.samples, len(problem_ids))]
     records = []
-    dropped_identical = 0
-    for example in raw:
-        answer = example["answer"].strip()
-        value = parse_answer(answer)
-        if value is None:
+    skipped_problems = dropped_identical = 0
+    for problem_id in problem_ids:
+        group = grouped[problem_id]
+        correct = group["correct"]
+        incorrect = group["incorrect"]
+        if not correct or not incorrect:
+            skipped_problems += 1
             continue
+        prompt = f"Question: {group['question']}\nAnswer:"
+        chosen_rollouts = [tokenize_math_completion(tokenizer, prompt, solution, config.max_length) for solution in correct]
+        rejected_rollouts = [tokenize_math_completion(tokenizer, prompt, solution, config.max_length) for solution in incorrect]
+        for chosen in chosen_rollouts:
+            for rejected in rejected_rollouts:
+                if chosen["input_ids"] == rejected["input_ids"]:
+                    dropped_identical += 1
+                    continue
+                records.append(
+                    {
+                        "problem_id": problem_id,
+                        "chosen_ids": chosen["input_ids"],
+                        "chosen_mask": chosen["attention_mask"],
+                        "rejected_ids": rejected["input_ids"],
+                        "rejected_mask": rejected["attention_mask"],
+                    }
+                )
 
-        prompt = f"Question: {example['question'].strip()}\nAnswer:"
-        wrong_answer = answer + f"\nTherefore, the answer is {value + random.randint(1, 9)}."
-        chosen = tokenize_math_completion(tokenizer, prompt, answer, config.max_length)
-        rejected = tokenize_math_completion(tokenizer, prompt, wrong_answer, config.max_length)
-
-        # Max-length truncation can remove the differing final answer entirely.
-        if chosen["input_ids"] == rejected["input_ids"]:
-            dropped_identical += 1
-            continue
-
-        records.append(
-            {
-                "chosen_ids": chosen["input_ids"],
-                "chosen_mask": chosen["attention_mask"],
-                "rejected_ids": rejected["input_ids"],
-                "rejected_mask": rejected["attention_mask"],
-            }
-        )
-
+    print(f"Selected {len(problem_ids)} problems; skipped {skipped_problems} without both labels.")
     if dropped_identical:
         print(f"Dropped {dropped_identical} pairs identical after max_length truncation.")
     return Dataset.from_list(records)
+
+
+def split_by_problem(data: Dataset, val_ratio: float, seed: int) -> tuple[Dataset, Dataset | None]:
+    """Split pairs by problem ID to prevent rollout leakage into validation."""
+    if val_ratio == 0.0:
+        return data, None
+    problem_ids = sorted(set(data["problem_id"]))
+    if len(problem_ids) < 2:
+        print("Fewer than two usable problems; training without a validation split.")
+        return data, None
+    random.Random(seed).shuffle(problem_ids)
+    val_problem_count = min(len(problem_ids) - 1, max(1, round(len(problem_ids) * val_ratio)))
+    validation_ids = set(problem_ids[:val_problem_count])
+    train_indices = [index for index, row in enumerate(data) if row["problem_id"] not in validation_ids]
+    val_indices = [index for index, row in enumerate(data) if row["problem_id"] in validation_ids]
+    return data.select(train_indices), data.select(val_indices)
 
 
 def collate_fn(batch: List[Dict], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
@@ -212,14 +259,12 @@ def train_preference_rm_gsm8k(config: Config) -> PreferenceRewardModel:
     init_wandb("preference_rm_gsm8k", config.model_dump(), config.use_wandb)
     tokenizer = load_tokenizer(config.model_id)
 
-    print(f"Building GSM8K preference dataset with {config.samples} source questions...")
+    print(f"Building rollout preference dataset from {config.dataset_name}...")
     data = build_preference_dataset(tokenizer, config)
     if len(data) == 0:
         raise ValueError("No usable pairs were produced. Increase max_length or samples.")
     print(f"Dataset size: {len(data)} preference pairs")
-    splits = data.train_test_split(test_size=config.val_ratio, seed=config.seed) if config.val_ratio else None
-    train_data = splits["train"] if splits else data
-    val_data = splits["test"] if splits else None
+    train_data, val_data = split_by_problem(data, config.val_ratio, config.seed)
     print(f"Train size: {len(train_data)} pairs")
     if val_data is not None:
         print(f"Validation size: {len(val_data)} pairs")
