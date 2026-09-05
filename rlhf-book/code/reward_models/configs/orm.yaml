@@ -10,13 +10,13 @@ model_id: Qwen/Qwen3-0.6B-Base
 freeze_backbone: true
 
 # Dataset
-dataset_name: openai/gsm8k
+dataset_name: reward_models/data/gsm8k_gpt4.jsonl
 dataset_split: train
-samples: 2000
+samples: 100
 
 # Training
-batch_size: 2
-grad_accum_steps: 16
+batch_size: 8
+grad_accum_steps: 4
 epochs: 3
 lr: 1.0e-4
 warmup_ratio: 0.1

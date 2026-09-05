@@ -20,7 +20,9 @@ Usage:
 """
 
 import argparse
+import json
 import random
+from pathlib import Path
 from typing import Dict, List
 
 import torch
@@ -92,13 +94,62 @@ def build_orm_dataset(
     tokenizer: AutoTokenizer,
     config: Config,
 ) -> Dataset:
-    """Build ORM training dataset from GSM8K.
+    """Build ORM examples from the configured rollout dataset.
 
-    For each question:
-    - Creates a positive example with the correct solution (label=1)
-    - Creates a negative example with a corrupted answer (label=0)
+    For the local JSONL rollout format, every row is already labeled with
+    ``label`` (1 for correct, 0 for incorrect).  We retain every rollout so
+    this ORM sees exactly the same questions and solutions as the preference
+    reward model.  The older GSM8K download/synthetic-negative path remains
+    available when ``dataset_name`` is a Hugging Face dataset ID.
     """
     random.seed(config.seed)
+
+    dataset_path = Path(config.dataset_name)
+    if not dataset_path.is_absolute() and not dataset_path.exists():
+        # Config paths are normally resolved from the code repository root;
+        # also support callers whose working directory is elsewhere.
+        dataset_path = Path(__file__).resolve().parent.parent / dataset_path
+    if dataset_path.exists() and dataset_path.suffix.lower() in {".jsonl", ".json"}:
+        records = []
+        with dataset_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSON on line {line_number} of {dataset_path}") from exc
+                if not isinstance(record, dict):
+                    continue
+                records.append(record)
+
+        grouped: Dict[str, List[Dict]] = {}
+        for record in records:
+            problem_id = str(record.get("problem_index", record.get("question", "")))
+            if not problem_id or not record.get("question") or not record.get("solution"):
+                continue
+            grouped.setdefault(problem_id, []).append(record)
+
+        problem_ids = list(grouped)
+        random.Random(config.seed).shuffle(problem_ids)
+        selected_ids = set(problem_ids[: min(config.samples, len(problem_ids))])
+        rows = []
+        for problem_id in problem_ids:
+            if problem_id not in selected_ids:
+                continue
+            for record in grouped[problem_id]:
+                label = int(bool(record.get("label", record.get("judge_correct", False))))
+                prompt = f"Question: {str(record['question']).strip()}\nAnswer:"
+                rows.append(pack_example(prompt, str(record["solution"]).strip(), label, tokenizer))
+
+        if not rows:
+            raise ValueError(f"No valid labeled rollouts found in {dataset_path}")
+        print(
+            f"Loaded {len(rows)} rollouts from {len(selected_ids)} problem IDs in {dataset_path}"
+        )
+        return Dataset.from_list(rows)
+
     raw = load_dataset(
         config.dataset_name,
         "main",
@@ -202,8 +253,76 @@ class OutcomeRewardModel(BaseRewardModel):
 
 
 # =============================================================================
-# Training
+# Evaluation helpers
 # =============================================================================
+
+
+@torch.no_grad()
+def evaluate_orm(
+    model: OutcomeRewardModel,
+    loader: DataLoader,
+    device: torch.device,
+    autocast_enabled: bool,
+    autocast_device_type: str,
+) -> dict[str, float]:
+    """Evaluate ORM loss and sequence-level accuracy on a validation split."""
+    model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        with torch.amp.autocast(
+            autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
+            loss, logits = model(**batch)
+
+        sequence_logits = last_token_values(logits, batch["attention_mask"])
+        sequence_labels = last_token_values(batch["labels"], batch["attention_mask"])
+        preds = (torch.sigmoid(sequence_logits) > 0.5).long()
+
+        batch_size = sequence_labels.numel()
+        total_loss += loss.item() * batch_size
+        total_correct += (preds == sequence_labels).sum().item()
+        total_examples += batch_size
+
+    n = max(1, total_examples)
+    return {"val/loss": total_loss / n, "val/accuracy": total_correct / n}
+
+
+def plot_loss_curves(
+    output_dir: Path,
+    train_steps: List[int],
+    train_losses: List[float],
+    val_steps: List[int],
+    val_losses: List[float],
+) -> None:
+    """Plot training/validation loss over optimizer steps if matplotlib is available."""
+    if not train_losses and not val_losses:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not installed; skipping loss curve plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    if train_losses:
+        ax.plot(train_steps, train_losses, label="train loss", linewidth=2)
+    if val_losses:
+        ax.plot(val_steps, val_losses, label="validation loss", linewidth=2)
+    ax.set_xlabel("Optimizer step")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training and Validation Loss")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "loss_curve.png", dpi=200)
+    plt.close(fig)
 
 
 def train_orm(
@@ -236,12 +355,35 @@ def train_orm(
     data = build_orm_dataset(tokenizer, config)
     print(f"Dataset size: {len(data)} examples")
 
+    if config.val_ratio > 0.0:
+        splits = data.train_test_split(test_size=config.val_ratio, seed=config.seed, shuffle=True)
+        train_data = splits["train"]
+        val_data = splits["test"]
+    else:
+        train_data = data
+        val_data = None
+
+    print(f"Train size: {len(train_data)} examples")
+    if val_data is not None:
+        print(f"Validation size: {len(val_data)} examples")
+
     loader = DataLoader(
-        data,
+        train_data,
         batch_size=config.batch_size,
         shuffle=True,
-        drop_last=len(data) > config.batch_size,
+        drop_last=len(train_data) > config.batch_size,
         collate_fn=lambda b: collate_fn(b, tokenizer),
+    )
+    val_loader = (
+        DataLoader(
+            val_data,
+            batch_size=config.batch_size,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=lambda b: collate_fn(b, tokenizer),
+        )
+        if val_data is not None
+        else None
     )
 
     # Initialize model
@@ -275,11 +417,17 @@ def train_orm(
         )
 
     # Mixed precision
-    autocast_enabled = torch.cuda.is_available()
+    autocast_enabled = device.type == "cuda" and torch.cuda.is_available()
+    autocast_device_type = "cuda" if autocast_enabled else "cpu"
 
     # Training loop
     global_step = 0
     grad_accum_steps = config.grad_accum_steps
+    eval_interval = config.eval_interval
+    train_loss_steps: List[int] = []
+    train_loss_values: List[float] = []
+    val_loss_steps: List[int] = []
+    val_loss_values: List[float] = []
     for epoch in range(config.epochs):
         print(f"Epoch {epoch + 1}/{config.epochs}")
         model.train()
@@ -297,7 +445,9 @@ def train_orm(
         for step, batch in tqdm(enumerate(loader)):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.amp.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+            with torch.amp.autocast(
+                autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+            ):
                 loss, logits = model(**batch)
             print(f"Step {step} | Forward pass done")
             (loss / grad_accum_steps).backward()
@@ -330,7 +480,23 @@ def train_orm(
                 avg_loss = accum_loss / accum_microbatches
                 acc = accum_correct / max(1, accum_examples)
                 print(f"Epoch {epoch} step {global_step} | loss {avg_loss:.4f} | acc {acc:.3f}")
+                train_loss_steps.append(global_step)
+                train_loss_values.append(avg_loss)
                 log_metrics({"loss": avg_loss, "accuracy": acc}, step=global_step)
+
+                if val_loader is not None and eval_interval > 0 and global_step % eval_interval == 0:
+                    val_metrics = evaluate_orm(
+                        model, val_loader, device, autocast_enabled, autocast_device_type
+                    )
+                    print(
+                        f"Eval step {global_step} | "
+                        f"Val Loss: {val_metrics['val/loss']:.4f} | "
+                        f"Val Accuracy: {val_metrics['val/accuracy']:.3f}"
+                    )
+                    val_loss_steps.append(global_step)
+                    val_loss_values.append(val_metrics["val/loss"])
+                    log_metrics(val_metrics, step=global_step)
+                    model.train()
 
                 # Reset accumulators
                 accum_loss = 0.0
@@ -343,8 +509,87 @@ def train_orm(
         print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Accuracy: {accuracy:.3f}")
         log_metrics({"epoch_loss": avg_loss, "epoch_accuracy": accuracy, "epoch": epoch})
 
+        should_run_epoch_eval = val_loader is not None and (
+            eval_interval <= 0 or global_step % eval_interval != 0
+        )
+        if should_run_epoch_eval:
+            val_metrics = evaluate_orm(
+                model, val_loader, device, autocast_enabled, autocast_device_type
+            )
+            print(
+                f"Epoch {epoch} | Val Loss: {val_metrics['val/loss']:.4f} | "
+                f"Val Accuracy: {val_metrics['val/accuracy']:.3f}"
+            )
+            val_loss_steps.append(global_step)
+            val_loss_values.append(val_metrics["val/loss"])
+            log_metrics({**val_metrics, "epoch": epoch}, step=global_step)
+            model.train()
+
+    save_model_artifacts(
+        model,
+        tokenizer,
+        config,
+        run_name="orm_gsm8k_full" if not config.freeze_backbone else "orm_gsm8k_head_only",
+        train_loss_steps=train_loss_steps,
+        train_loss_values=train_loss_values,
+        val_loss_steps=val_loss_steps,
+        val_loss_values=val_loss_values,
+    )
     finish_wandb()
     return model
+
+
+def save_model_artifacts(
+    model: OutcomeRewardModel,
+    tokenizer: AutoTokenizer,
+    config: Config,
+    run_name: str,
+    train_loss_steps: List[int],
+    train_loss_values: List[float],
+    val_loss_steps: List[int],
+    val_loss_values: List[float],
+) -> Path:
+    """Persist the trained reward model, tokenizer, and training metadata."""
+    
+    output_dir = Path(__file__).resolve().parent / "trained_models" / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always save a full state dict so the trained weights are recoverable
+    # even if the wrapper class does not implement Hugging Face serialization.
+    torch.save(model.state_dict(), output_dir / "model_state.pt")
+
+    if hasattr(model, "head"):
+        torch.save(model.head.state_dict(), output_dir / "reward_head.pt")
+
+    model_save_pretrained = getattr(model, "save_pretrained", None)
+    if callable(model_save_pretrained):
+        model_save_pretrained(str(output_dir))
+    else:
+        for attr_name in ("model", "backbone", "base_model", "transformer", "llm"):
+            backbone = getattr(model, attr_name, None)
+            if backbone is not None and hasattr(backbone, "save_pretrained"):
+                backbone.save_pretrained(output_dir / "backbone")
+                break
+
+    tokenizer.save_pretrained(output_dir)
+    (output_dir / "training_config.json").write_text(config.model_dump_json(indent=2) + "\n")
+    (output_dir / "loss_history.json").write_text(
+        (
+            "{\n"
+            f'  "train": {{"steps": {train_loss_steps}, "loss": {train_loss_values}}},\n'
+            f'  "validation": {{"steps": {val_loss_steps}, "loss": {val_loss_values}}}\n'
+            "}\n"
+        )
+    )
+    plot_loss_curves(
+        output_dir,
+        train_steps=train_loss_steps,
+        train_losses=train_loss_values,
+        val_steps=val_loss_steps,
+        val_losses=val_loss_values,
+    )
+    print(f"Saved trained ORM artifacts to {output_dir}")
+    return output_dir
 
 
 # =============================================================================
@@ -380,27 +625,38 @@ def demo_scoring(model: OutcomeRewardModel, tokenizer: AutoTokenizer, config: Co
     device = next(model.parameters()).device
     random.seed(config.seed)
 
-    # Get a random test example
-    test_data = load_dataset(
-        config.dataset_name,
-        "main",
-        split="test",
-    )
-    sample = random.choice(test_data)
-
-    question = sample["question"].strip()
-    answer = sample["answer"].strip()
-    value = parse_answer(answer)
-
-    if value is None:
-        print("Could not parse answer from sample")
-        return
+    dataset_path = Path(config.dataset_name)
+    if not dataset_path.is_absolute() and not dataset_path.exists():
+        dataset_path = Path(__file__).resolve().parent.parent / dataset_path
+    if dataset_path.is_file():
+        with dataset_path.open(encoding="utf-8") as handle:
+            rollout_data = [json.loads(line) for line in handle if line.strip()]
+        sample = random.choice(rollout_data)
+        question = str(sample["question"]).strip()
+        answer = str(sample["solution"]).strip()
+        value = sample.get("candidate_answer", parse_answer(answer))
+        opposite = next(
+            (row for row in rollout_data
+             if row.get("problem_index") == sample.get("problem_index")
+             and int(row.get("label", 0)) != int(sample.get("label", 0))),
+            None,
+        )
+        wrong_answer = str(opposite["solution"]).strip() if opposite else answer
+        wrong_value = opposite.get("candidate_answer", "incorrect") if opposite else "incorrect"
+    else:
+        # Get a random test example from the original GSM8K dataset.
+        test_data = load_dataset(config.dataset_name, "main", split="test")
+        sample = random.choice(test_data)
+        question = sample["question"].strip()
+        answer = sample["answer"].strip()
+        value = parse_answer(answer)
+        if value is None:
+            print("Could not parse answer from sample")
+            return
+        wrong_value = value + random.randint(1, 9)
+        wrong_answer = answer + f"\nTherefore, the answer is {wrong_value}."
 
     prompt = f"Question: {question}\nAnswer:"
-
-    # Create correct and incorrect completions
-    wrong_value = value + random.randint(1, 9)
-    wrong_answer = answer + f"\nTherefore, the answer is {wrong_value}."
 
     print("=" * 60)
     print("Question:", question)
