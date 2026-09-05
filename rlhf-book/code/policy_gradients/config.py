@@ -1,0 +1,151 @@
+# Configuration for Policy Gradient Training
+#
+# Original implementation by Zafir Stojanovski (@zafstojano)
+# Source: https://github.com/zafstojano/policy-gradients
+# License: Apache 2.0
+
+from typing import Any, Literal
+
+import yaml
+from pydantic import BaseModel, model_validator
+
+
+class DatasetSpec(BaseModel):
+    """Specification for a single dataset in the training mixture."""
+
+    name: str
+    weight: int = 1
+    config: dict[str, Any] = {}
+
+
+class DataConfig(BaseModel):
+    """Configuration for the training data."""
+
+    specs: list[DatasetSpec]
+    size: int = 3000
+
+
+class Config(BaseModel):
+    """Full training configuration.
+
+    Attributes:
+        data: Dataset configuration
+        loss: Loss function (reinforce, rloo, ppo, grpo, drgrpo, gspo, cispo, sapo,
+            dapo, maxrl)
+        model_name: Hugging Face model identifier
+
+        # Clipping (GRPO, DrGRPO, GSPO, CISPO, PPO, DAPO)
+        clip_eps_lo: Lower clipping bound for policy ratio
+        clip_eps_hi: Upper clipping bound for policy ratio
+
+        # SAPO-specific
+        sapo_temp_pos: Sigmoid temperature for positive advantages
+        sapo_temp_neg: Sigmoid temperature for negative advantages
+
+        # DAPO-specific
+        l_cache: Overlong penalty cache length
+        l_max: Overlong penalty maximum length
+        accuracy_min_reward: Minimum correctness reward for dynamic filtering
+        accuracy_max_reward: Maximum correctness reward for dynamic filtering
+
+        # PPO-specific
+        clip_eps_val: Clipping bound for value function
+        gamma: Discount factor for GAE
+        lam: Lambda for GAE
+        vf_coef: Value function loss coefficient
+        val_model_device_id: GPU for value model
+
+        # Optional KL penalty (REINFORCE, RLOO, GRPO, etc.)
+        beta: KL penalty coefficient (0 = disabled)
+        kl_estimator: KL estimator variant ('kl1', 'kl2', or 'kl3')
+        ref_model_device_id: GPU for reference model (when beta > 0)
+
+        # Generation
+        temperature, top_p, top_k, min_p: Sampling parameters
+        max_new_tokens: Maximum tokens to generate
+
+        # Training
+        lr: Learning rate
+        prompts_per_step: Prompts per training step
+        num_rollouts: Rollouts per prompt (1 for REINFORCE/PPO, >1 for GRPO/RLOO)
+        train_batch_size: Batch size during training
+        batch_acc: Gradient accumulation steps
+        max_norm: Gradient clipping norm
+        seed: Random seed
+        device: Device selection (auto, cuda, cpu)
+        model_device_id: GPU for policy model
+
+        # Logging
+        wandb_project, wandb_run_name: Weights & Biases logging
+    """
+
+    data: DataConfig
+    loss: str
+    model_name: str = "Qwen/Qwen3-1.7B"
+
+    # Clipping params (used by GRPO, DrGRPO, GSPO, CISPO, PPO)
+    clip_eps_lo: float = 0.2
+    clip_eps_hi: float = 0.2
+
+    # PPO-specific params
+    clip_eps_val: float = 0.2
+    gamma: float = 0.99
+    lam: float = 0.95
+    vf_coef: float = 0.1
+    val_model_device_id: int = 0
+
+    # SAPO-specific params (soft sigmoid gate temperatures)
+    sapo_temp_pos: float = 1.0
+    sapo_temp_neg: float = 1.05
+
+    # DAPO-specific params (overlong length penalty)
+    l_cache: int = 256
+    l_max: int = 512
+
+    # DAPO-specific min and max rewards
+    accuracy_min_reward: float = 0.0
+    accuracy_max_reward: float = 1.0
+
+    # Reward shaping
+    format_weight: float = 0.5
+
+    # KL penalty (optional, for REINFORCE/RLOO/GRPO when beta > 0)
+    beta: float = 0.0
+    kl_estimator: str = "kl3"
+    ref_model_device_id: int = 0
+
+    # Generation params
+    temperature: float = 0.6
+    top_p: float = 0.95
+    top_k: int = 20
+    min_p: float = 0.0
+    max_new_tokens: int = 512
+
+    # Training params
+    lr: float = 5e-6
+    prompts_per_step: int = 4
+    num_rollouts: int = 8
+    train_batch_size: int = 2
+    batch_acc: int = 4
+    max_norm: float = 1.0
+    seed: int = 42
+    device: Literal["auto", "cuda", "cpu"] = "auto"
+    model_device_id: int = 0
+
+    # Logging
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
+    wandb_run_name: str | None = None
+
+    @model_validator(mode="after")
+    def validate_config(self) -> "Config":
+        if self.kl_estimator not in ("kl1", "kl2", "kl3"):
+            raise ValueError("kl_estimator must be one of: 'kl1', 'kl2', 'kl3'.")
+        return self
+
+
+def load_config(config_path: str) -> Config:
+    """Load configuration from a YAML file."""
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+    return Config(**raw)

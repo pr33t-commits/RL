@@ -1,0 +1,359 @@
+# Policy Gradient Loss Functions
+#
+# Original implementation by Zafir Stojanovski (@zafstojano)
+# Source: https://github.com/zafstojano/policy-gradients
+# License: Apache 2.0
+#
+# Implements:
+# - REINFORCE (Williams, 1992)
+# - PPO (Schulman et al., 2017)
+# - GRPO (Shao et al., 2024)
+# - GSPO (Zheng et al., 2025)
+# - CISPO (MiniMax, 2025)
+# - SAPO (Qwen Team, 2025)
+# - DAPO (ByteDance Team, 2025)
+# - MaxRL (Tajwar et al., 2026)
+
+import torch
+import torch.nn as nn
+
+from .buffer import Experience
+
+
+def approx_kl3(
+    log_probs: torch.Tensor, log_probs_ref: torch.Tensor, action_mask: torch.Tensor
+) -> torch.Tensor:
+    """Monte-Carlo approximation of KL divergence (k3 estimator).
+
+    Uses ``r = pi_ref / pi`` so that ``r - log(r) - 1`` estimates
+    ``KL(pi || pi_ref)`` for samples drawn from ``pi``.
+
+    See: http://joschu.net/blog/kl-approx.html
+    """
+    log_ratio = log_probs_ref - log_probs
+    if action_mask is not None:
+        log_ratio = log_ratio * action_mask
+    return torch.expm1(log_ratio) - log_ratio
+
+
+def approx_kl2(
+    log_probs: torch.Tensor, log_probs_ref: torch.Tensor, action_mask: torch.Tensor
+) -> torch.Tensor:
+    """Monte-Carlo approximation of KL divergence (k2 estimator).
+
+    See: http://joschu.net/blog/kl-approx.html
+    """
+    log_ratio = log_probs - log_probs_ref
+    if action_mask is not None:
+        log_ratio = log_ratio * action_mask
+    return (log_ratio**2) / 2
+
+
+def approx_kl1(
+    log_probs: torch.Tensor, log_probs_ref: torch.Tensor, action_mask: torch.Tensor
+) -> torch.Tensor:
+    """Monte-Carlo approximation of KL divergence (k1 estimator).
+
+    Samples are drawn from ``pi``, so the estimator of ``KL(pi || pi_ref)``
+    is ``log(pi / pi_ref)``.
+
+    See: http://joschu.net/blog/kl-approx.html
+    """
+    log_ratio = log_probs - log_probs_ref
+    if action_mask is not None:
+        log_ratio = log_ratio * action_mask
+    return log_ratio
+
+
+def get_approx_kl(
+    kl_estimator: str,
+    log_probs: torch.Tensor,
+    log_probs_ref: torch.Tensor,
+    action_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute KL approximation using the selected estimator."""
+    if kl_estimator == "kl1":
+        return approx_kl1(log_probs, log_probs_ref, action_mask)
+    if kl_estimator == "kl2":
+        return approx_kl2(log_probs, log_probs_ref, action_mask)
+    if kl_estimator == "kl3":
+        return approx_kl3(log_probs, log_probs_ref, action_mask)
+    raise ValueError(f"Unsupported kl_estimator: {kl_estimator}")
+
+
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor | None,
+    dim: int | None = None,
+    keepdim: bool = False,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Compute mean over masked positions."""
+    if mask is None:
+        return tensor.mean(dim=dim, keepdim=keepdim)
+    return (tensor * mask).sum(dim=dim, keepdim=keepdim) / mask.sum(
+        dim=dim, keepdim=keepdim
+    ).clamp_min(eps)
+
+
+class GRPOLoss(nn.Module):
+    """Group Relative Policy Optimization loss (Shao et al., 2024).
+
+    GRPO uses group-level advantage normalization and clipped ratio updates.
+    See Chapter 6 of RLHF Book for mathematical derivation.
+    """
+
+    def __init__(
+        self, clip_eps_lo: float, clip_eps_hi: float, beta: float, kl_estimator: str, **kwargs
+    ) -> None:
+        super().__init__()
+        self.clip_eps_lo = clip_eps_lo
+        self.clip_eps_hi = clip_eps_hi
+        self.beta = beta
+        self.kl_estimator = kl_estimator
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        # Policy loss with clipping
+        ratio = (log_probs - experience.log_probs_old).exp()
+        unclipped_term = ratio * experience.advantages
+        clipped_term = (
+            ratio.clamp(1 - self.clip_eps_lo, 1 + self.clip_eps_hi) * experience.advantages
+        )
+        policy_loss = -torch.min(unclipped_term, clipped_term)
+
+        # Optional KL penalty
+        if self.beta:
+            kl_loss = get_approx_kl(
+                self.kl_estimator, log_probs, experience.log_probs_ref, experience.action_mask
+            )
+        else:
+            kl_loss = torch.tensor(0.0, device=log_probs.device, dtype=torch.float32)
+
+        loss = policy_loss + self.beta * kl_loss
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class GSPOLoss(nn.Module):
+    """Group-Sequence Policy Optimization loss (Zheng et al., 2025).
+
+    GSPO applies clipping to sequence-level log probability ratios.
+    """
+
+    def __init__(
+        self, clip_eps_lo: float, clip_eps_hi: float, beta: float, kl_estimator: str, **kwargs
+    ) -> None:
+        super().__init__()
+        self.clip_eps_lo = clip_eps_lo
+        self.clip_eps_hi = clip_eps_hi
+        self.beta = beta
+        self.kl_estimator = kl_estimator
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        # Sequence-level ratio (average log prob difference)
+        seq_logprobs = masked_mean(
+            log_probs - experience.log_probs_old, mask=experience.action_mask, dim=-1, keepdim=True
+        ).exp()
+        unclipped_term = seq_logprobs * experience.advantages
+        clipped_term = (
+            seq_logprobs.clamp(1 - self.clip_eps_lo, 1 + self.clip_eps_hi) * experience.advantages
+        )
+        policy_loss = -torch.min(unclipped_term, clipped_term)
+
+        # Optional KL penalty
+        if self.beta:
+            kl_loss = get_approx_kl(
+                self.kl_estimator, log_probs, experience.log_probs_ref, experience.action_mask
+            )
+        else:
+            kl_loss = torch.tensor(0.0, device=log_probs.device, dtype=torch.float32)
+
+        loss = policy_loss + self.beta * kl_loss
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class ReinforceLoss(nn.Module):
+    """REINFORCE loss (Williams, 1992).
+
+    The classic policy gradient: -log(pi) * advantage
+    See Chapter 6 of RLHF Book for derivation from the policy gradient theorem.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        loss = -(log_probs * experience.advantages)
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class MaxRLLoss(nn.Module):
+    """MaxRL loss (Tajwar et al., 2026).
+
+    Uses binary rewards per completion:
+        r = correctness * format
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        loss = -(log_probs * experience.advantages)
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class CISPOLoss(nn.Module):
+    """Clipped Importance Sampling Policy Optimization loss (MiniMax, 2025).
+
+    CISPO uses stop-gradient on the clipped ratio, providing a different
+    gradient signal than PPO/GRPO.
+    """
+
+    def __init__(
+        self, clip_eps_lo: float, clip_eps_hi: float, beta: float, kl_estimator: str, **kwargs
+    ) -> None:
+        super().__init__()
+        self.clip_eps_lo = clip_eps_lo
+        self.clip_eps_hi = clip_eps_hi
+        self.beta = beta
+        self.kl_estimator = kl_estimator
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        # Stop gradient on clipped ratio
+        with torch.no_grad():
+            ratio = (log_probs - experience.log_probs_old).exp()
+            clipped_ratio = ratio.clamp(1 - self.clip_eps_lo, 1 + self.clip_eps_hi)
+        policy_loss = -clipped_ratio * experience.advantages * log_probs
+
+        # Optional KL penalty
+        if self.beta:
+            kl_loss = get_approx_kl(
+                self.kl_estimator, log_probs, experience.log_probs_ref, experience.action_mask
+            )
+        else:
+            kl_loss = torch.tensor(0.0, device=log_probs.device, dtype=torch.float32)
+
+        loss = policy_loss + self.beta * kl_loss
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class SAPOLoss(nn.Module):
+    """Soft Adaptive Policy Optimization loss (Qwen Team, 2025).
+
+    Replaces hard clipping with a smooth sigmoid gate that continuously
+    attenuates gradients as tokens move off-policy.
+    See Chapter 6 - Further Reading of the RLHF Book
+    """
+
+    def __init__(
+        self, sapo_temp_pos: float, sapo_temp_neg: float, beta: float, kl_estimator: str, **kwargs
+    ) -> None:
+        super().__init__()
+        self.sapo_temp_pos = sapo_temp_pos
+        self.sapo_temp_neg = sapo_temp_neg
+        self.beta = beta
+        self.kl_estimator = kl_estimator
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        # Token-level importance ratio
+        ratio = (log_probs - experience.log_probs_old).exp()
+
+        # Asymmetric temperature: tighter curve for negative advantages
+        temps = torch.where(experience.advantages > 0, self.sapo_temp_pos, self.sapo_temp_neg)
+
+        # Soft sigmoid gate
+        soft_gate = torch.sigmoid(temps * (ratio - 1)) * 4 / temps
+        policy_loss = -soft_gate * experience.advantages
+
+        # Optional KL penalty (default for SAPO = 0)
+        if self.beta:
+            kl_loss = get_approx_kl(
+                self.kl_estimator, log_probs, experience.log_probs_ref, experience.action_mask
+            )
+        else:
+            kl_loss = torch.tensor(0.0, device=log_probs.device, dtype=torch.float32)
+
+        loss = policy_loss + self.beta * kl_loss
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class PPOLoss(nn.Module):
+    """Proximal Policy Optimization loss (Schulman et al., 2017).
+
+    PPO combines clipped policy updates with a value function baseline.
+    See Chapter 6 of RLHF Book for the full derivation.
+    """
+
+    def __init__(
+        self,
+        clip_eps_lo: float,
+        clip_eps_hi: float,
+        clip_eps_val: float,
+        vf_coef: float,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.clip_eps_lo = clip_eps_lo
+        self.clip_eps_hi = clip_eps_hi
+        self.clip_eps_val = clip_eps_val
+        self.vf_coef = vf_coef
+
+    def forward(
+        self, log_probs: torch.Tensor, experience: Experience, values: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
+        # Value loss with clipping
+        values = values.to(log_probs.device)
+        returns = (
+            experience.advantages + experience.values_old
+        )  # A_t = G_t - V(s_t) => G_t = A_t + V(s_t)
+        values_clipped = torch.clamp(
+            values,
+            experience.values_old - self.clip_eps_val,
+            experience.values_old + self.clip_eps_val,
+        )
+        val_unclipped_term = 0.5 * (returns - values) ** 2
+        val_clipped_term = 0.5 * (returns - values_clipped) ** 2
+        val_loss = torch.max(val_unclipped_term, val_clipped_term)
+
+        # Policy loss with clipping
+        policy_ratio = (log_probs - experience.log_probs_old).exp()
+        policy_unclipped_term = policy_ratio * experience.advantages
+        policy_clipped_term = (
+            policy_ratio.clamp(1 - self.clip_eps_lo, 1 + self.clip_eps_hi) * experience.advantages
+        )
+        policy_loss = -torch.min(policy_unclipped_term, policy_clipped_term)
+
+        loss = policy_loss + self.vf_coef * val_loss
+        loss = masked_mean(loss, mask=experience.action_mask, dim=-1).mean(dim=0)
+        return loss
+
+
+class DAPOLoss(nn.Module):
+    """Decoupled Clip and Dynamic sAmpling Policy Optimization loss (ByteDance, 2025).
+
+    DAPO uses token-level loss normalization, decoupled lower/upper clipping bounds
+    (Clip-Higher), and no KL penalty. See Section 3 of the DAPO paper.
+    """
+
+    def __init__(self, clip_eps_lo: float, clip_eps_hi: float, **kwargs) -> None:
+        super().__init__()
+        self.clip_eps_lo = clip_eps_lo
+        self.clip_eps_hi = clip_eps_hi
+
+    def forward(self, log_probs: torch.Tensor, experience: Experience, **kwargs) -> torch.Tensor:
+        # Policy loss with clipping
+        ratio = (log_probs - experience.log_probs_old).exp()
+        unclipped_term = ratio * experience.advantages
+        clipped_term = (
+            ratio.clamp(1 - self.clip_eps_lo, 1 + self.clip_eps_hi) * experience.advantages
+        )
+        per_token_loss = -torch.min(unclipped_term, clipped_term)
+        mask = experience.action_mask.to(per_token_loss.dtype)
+        total_tokens = mask.sum().clamp(1e-8)
+        total_loss = (per_token_loss * mask).sum()
+        return total_loss / total_tokens

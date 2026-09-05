@@ -1,0 +1,98 @@
+[project]
+name = "rlhf-book-code"
+version = "0.4.0"
+description = "Educational code examples for RLHF Book (https://rlhfbook.com)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    # Core ML
+    "torch>=2.6.0",
+    "transformers>=4.40.0",
+    "datasets>=2.19.0",
+    "accelerate>=0.30.0",
+    # Config & logging
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+    "wandb>=0.17.0",
+    "rich>=13.0.0",
+    "tqdm>=4.66.0",
+    # Policy gradients (procedural datasets)
+    "reasoning-gym>=0.1.24",
+    "tensordict>=0.12.2",
+]
+
+[project.optional-dependencies]
+# Flash attention - optional speedup for x86_64 NVIDIA GPUs
+# The code automatically falls back to PyTorch SDPA if not installed
+flash = [
+    "flash-attn>=2.5.0; platform_machine == 'x86_64'",
+]
+
+# Diagnostics (plotting + dataframes for rejection_sampling.diagnostics)
+diagnostics = [
+    "matplotlib>=3.8.0",
+    "pandas>=2.1.0",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+    "pre-commit>=3.7.0",
+]
+
+[project.scripts]
+train-policy = "policy_gradients.train:main_cli"
+train-dpo = "direct_alignment.train:main_cli"
+train-sft = "instruction_tuning.train:main_cli"
+train-preference-rm = "reward_models.train_preference_rm:main"
+train-orm = "reward_models.train_orm:main"
+train-prm = "reward_models.train_prm:main"
+rs-preprocess = "rejection_sampling.preprocess:main_cli"
+rs-train = "rejection_sampling.train:main_cli"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["policy_gradients*", "reward_models*", "direct_alignment*", "rejection_sampling*", "instruction_tuning*", "distillation*"]
+
+[tool.uv]
+package = true
+
+# flash-attn needs torch at build time but doesn't declare it
+# This injects the project's torch into flash-attn's build environment
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+# PyTorch CUDA wheels - only use cu126 on x86_64 Linux
+# aarch64 (DGX Spark) uses system PyTorch or cu130 wheels
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "platform_system == 'Linux' and platform_machine == 'x86_64'" },
+    { index = "pytorch-cu130", marker = "platform_system == 'Linux' and platform_machine == 'aarch64'" },
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "C4"]
+ignore = ["E501", "B007", "F841", "E731", "B023"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-third-party = ["wandb"]
